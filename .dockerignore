@@ -1,0 +1,5 @@
+# Everything is excluded, then the one file the image needs is allowed back in.
+# This is deliberate: the boards directory runs to tens of gigabytes and would
+# otherwise be uploaded to the daemon on every build.
+*
+!serve.py

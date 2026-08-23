@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+#
+# boardctl — export Freeform boards and serve them from a container.
+#
+# The image holds the server only. Boards live on the host and are mounted
+# read-only, which is what makes the two things you actually want to do cheap:
+#
+#   refresh   re-export from Freeform and swap the result into place, with no
+#             rebuild and no restart — the container is already looking at
+#             that directory
+#   move      copy the export directory to another machine, point BOARDS_DIR
+#             at it, and bring the same image up there
+#
+# Written for bash 3.2 so it runs on a stock macOS as well as on a server.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
+
+# ---- configuration ---------------------------------------------------------
+
+CONFIG_VARS="BOARDS_DIR IGNORED_DIR IGNORE_FILE BIND_ADDR PORT IMAGE CONTAINER FREEFORM_AUTH FREEFORM_ASSET_MAX_AGE"
+
+# Precedence, highest first: the environment, then .env, then these defaults.
+# Anything already exported is put back after .env has been read.
+ENV_OVERRIDES="$(export -p | grep -E "^(declare -x |export )($(echo $CONFIG_VARS | tr ' ' '|'))=" || true)"
+
+BOARDS_DIR="./boards"
+# Where boards named in the ignore file go. Exported and viewable, but never
+# mounted into the container and never in the served index.
+IGNORED_DIR="./boards-ignored"
+IGNORE_FILE=".boardignore"
+BIND_ADDR="127.0.0.1"
+PORT="9384"
+IMAGE="freeform-boards"
+CONTAINER="freeform-boards"
+FREEFORM_AUTH=""
+FREEFORM_ASSET_MAX_AGE="300"
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
+eval "$ENV_OVERRIDES"
+
+abs_path() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *)  printf '%s' "$HERE/${1#./}" ;;
+  esac
+}
+ABS_BOARDS="$(abs_path "$BOARDS_DIR")"
+ABS_IGNORED="$(abs_path "$IGNORED_DIR")"
+ABS_IGNORE_FILE="$(abs_path "$IGNORE_FILE")"
+
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+info()  { printf '  %s\n' "$*"; }
+warn()  { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+die()   { printf '\033[31merror\033[0m %s\n' "$*" >&2; exit 1; }
+
+have_docker() { command -v docker >/dev/null 2>&1; }
+
+docker_ready() {
+  have_docker && docker info >/dev/null 2>&1
+}
+
+require_docker() {
+  have_docker || die "docker is not installed."
+  docker info >/dev/null 2>&1 || die "the docker daemon is not reachable.
+  Colima:         colima start
+  Docker Desktop: open -a Docker"
+}
+
+container_state() {
+  # docker inspect prints an empty line on stdout as well as failing when the
+  # container is missing, so the output is trimmed rather than trusted.
+  local out
+  out="$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || true)"
+  out="$(printf '%s' "$out" | tr -d '[:space:]')"
+  if [ -n "$out" ]; then printf '%s' "$out"; else printf 'absent'; fi
+}
+
+# ---- commands --------------------------------------------------------------
+
+cmd_build() {
+  require_docker
+  # A root-owned ~/.docker/buildx, usually left behind by a `sudo docker`
+  # somewhere in the past, makes buildx refuse to start. Nothing here needs
+  # that directory, so point buildx at one we can actually read.
+  if [ -d "$HOME/.docker/buildx" ] && [ ! -r "$HOME/.docker/buildx" ]; then
+    export BUILDX_CONFIG="${BUILDX_CONFIG:-$HERE/.buildx}"
+    warn "$HOME/.docker/buildx is not readable by you — using $BUILDX_CONFIG"
+    warn "to fix it for good:  sudo chown -R \"$(id -un)\" $HOME/.docker/buildx"
+  fi
+  bold "Building $IMAGE"
+  docker build --tag "$IMAGE:latest" --file Dockerfile . "$@"
+}
+
+cmd_up() {
+  require_docker
+  [ -d "$ABS_BOARDS" ] || die "no export at $ABS_BOARDS
+  Make one:  ./boardctl refresh"
+
+  # dockerRun.sh holds the one copy of the docker run invocation, so the two
+  # entry points cannot drift apart. It takes its settings from the
+  # environment, which is what is being handed to it here.
+  BOARDS_DIR="$ABS_BOARDS" \
+  BIND_ADDR="$BIND_ADDR" \
+  PORT="$PORT" \
+  IMAGE="$IMAGE" \
+  CONTAINER="$CONTAINER" \
+  FREEFORM_AUTH="$FREEFORM_AUTH" \
+  FREEFORM_ASSET_MAX_AGE="$FREEFORM_ASSET_MAX_AGE" \
+    "$HERE/dockerRun.sh" "$@"
+}
+
+wait_healthy() {
+  local host="$BIND_ADDR" i
+  [ "$host" = "0.0.0.0" ] && host="127.0.0.1"
+  for i in $(seq 1 50); do
+    if curl -fsS -o /dev/null --max-time 2 "http://$host:$PORT/healthz" 2>/dev/null; then
+      info "serving  http://$host:$PORT/"
+      [ -n "$FREEFORM_AUTH" ] && info "basic auth is on"
+      return 0
+    fi
+    if [ "$(container_state)" = "exited" ]; then
+      docker logs --tail 20 "$CONTAINER" >&2
+      die "the container exited on startup."
+    fi
+    sleep 0.2
+  done
+  warn "no answer on http://$host:$PORT/healthz yet — check ./boardctl logs"
+}
+
+cmd_down() {
+  require_docker
+  if [ "$(container_state)" = "absent" ]; then
+    info "not running"
+    return 0
+  fi
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  info "stopped $CONTAINER"
+}
+
+cmd_restart() { cmd_down; cmd_up; }
+
+cmd_logs() { require_docker; docker logs "$@" "$CONTAINER"; }
+
+cmd_status() {
+  bold "Export"
+  if [ -d "$ABS_BOARDS" ]; then
+    local count
+    count=$(find "$ABS_BOARDS" -mindepth 2 -maxdepth 2 -name index.html 2>/dev/null | wc -l | tr -d ' ')
+    info "$ABS_BOARDS"
+    info "$count board(s), $(du -sh "$ABS_BOARDS" 2>/dev/null | cut -f1) on disk"
+    if [ -f "$ABS_BOARDS/index.html" ]; then
+      info "last refreshed $(date -r "$ABS_BOARDS/index.html" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+    fi
+  else
+    info "none at $ABS_BOARDS"
+  fi
+
+  bold "Held back"
+  if [ -f "$HERE/boardfilter.py" ] && [ -f "$HERE/freeform.py" ] \
+     && python3 -c "" 2>/dev/null; then
+    if listing="$(python3 "$HERE/freeform.py" list --json 2>/dev/null)"; then
+      printf '%s' "$listing" | python3 "$HERE/boardfilter.py" "$ABS_IGNORE_FILE" --report
+    else
+      info "cannot read the board list here (Freeform is on the other machine)"
+    fi
+  fi
+  if [ -d "$ABS_IGNORED" ]; then
+    info "held-back export: $ABS_IGNORED ($(du -sh "$ABS_IGNORED" 2>/dev/null | cut -f1))"
+  fi
+
+  bold "Container"
+  if ! have_docker; then
+    info "docker is not installed"
+  elif ! docker_ready; then
+    info "docker daemon is not running"
+  else
+    local state; state="$(container_state)"
+    info "$CONTAINER: $state"
+    if [ "$state" = "running" ]; then
+      info "health: $(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER" 2>/dev/null)"
+      info "mounted: $(docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}} ({{if .RW}}rw{{else}}ro{{end}}){{end}}' "$CONTAINER" 2>/dev/null)"
+    fi
+    docker image inspect "$IMAGE:latest" >/dev/null 2>&1 \
+      && info "image: $IMAGE:latest, $(docker image inspect -f '{{.Size}}' "$IMAGE:latest" | awk '{printf "%.0f MB", $1/1048576}')" \
+      || info "image: not built"
+  fi
+
+  bold "Reachable"
+  local host="$BIND_ADDR"; [ "$host" = "0.0.0.0" ] && host="127.0.0.1"
+  if curl -fsS -o /dev/null --max-time 2 "http://$host:$PORT/healthz" 2>/dev/null; then
+    info "http://$host:$PORT/ answering"
+  else
+    info "nothing answering on http://$host:$PORT/"
+  fi
+}
+
+cmd_serve() {
+  # No container: useful for a quick look, and the only option on a machine
+  # without docker.
+  exec python3 "$HERE/serve.py" "$ABS_BOARDS" \
+    --host "$BIND_ADDR" --port "$PORT" \
+    ${FREEFORM_AUTH:+--auth "$FREEFORM_AUTH"} \
+    --asset-max-age "$FREEFORM_ASSET_MAX_AGE" "$@"
+}
+
+# ---- refresh ---------------------------------------------------------------
+
+STAGE=""
+OLD=""
+SWAP_FAILED=0
+
+cleanup() {
+  local status=$?
+  if [ -n "$STAGE" ] && [ -d "$STAGE" ] && [ "$SWAP_FAILED" -eq 0 ]; then
+    rm -rf "$STAGE"
+  fi
+  if [ "$SWAP_FAILED" -eq 1 ]; then
+    warn "the swap did not finish. Nothing was deleted:"
+    warn "  previous export: $OLD"
+    warn "  new export:      $STAGE"
+  fi
+  exit $status
+}
+
+export_swap() {
+  # export_swap <destination> <label> [exporter flags...]
+  local dest="$1"; shift
+  local label="$1"; shift
+
+  if [ "$REFRESH_INPLACE" -eq 1 ]; then
+    bold "Exporting $label in place"
+    warn "$label is unavailable while this runs"
+    if [ -d "$dest" ]; then
+      find "$dest" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    else
+      mkdir -p "$dest"
+    fi
+    python3 "$HERE/freeform.py" export "$dest" "$@"
+    return 0
+  fi
+
+  STAGE="$dest.staging.$$"
+  OLD="$dest.previous"
+  [ "$REFRESH_KEEP_OLD" -eq 1 ] || OLD="$dest.old.$$"
+
+  bold "Exporting $label"
+  info "staging in $STAGE"
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE"
+  python3 "$HERE/freeform.py" export "$STAGE" "$@"
+
+  local produced
+  produced=$(find "$STAGE" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+  [ "$produced" -gt 0 ] || die "the export produced nothing; leaving $dest alone."
+
+  # The directory keeps its identity: only its contents are replaced.
+  # Renaming the directory itself would leave the container holding the old
+  # one, because a bind mount follows the inode and not the path.
+  bold "Swapping $label into place"
+  SWAP_FAILED=1
+  rm -rf "$OLD"
+  mkdir -p "$OLD"
+  if [ -d "$dest" ]; then
+    find "$dest" -mindepth 1 -maxdepth 1 -exec mv {} "$OLD"/ \;
+  else
+    mkdir -p "$dest"
+  fi
+  find "$STAGE" -mindepth 1 -maxdepth 1 -exec mv {} "$dest"/ \;
+  SWAP_FAILED=0
+  rmdir "$STAGE" 2>/dev/null || true
+  STAGE=""
+
+  if [ "$REFRESH_KEEP_OLD" -eq 1 ]; then
+    info "previous export kept at $OLD"
+  else
+    rm -rf "$OLD"
+  fi
+}
+
+empty_out() {
+  # Used when the ignore file holds every board back: the served directory has
+  # to end up empty rather than keep serving what it served last time.
+  local dest="$1"
+  mkdir -p "$dest"
+  find "$dest" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+}
+
+cmd_refresh() {
+  REFRESH_INPLACE=0
+  REFRESH_KEEP_OLD=0
+  local rebuild=0 no_serve=0
+  local export_args=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rebuild)  rebuild=1 ;;
+      --in-place) REFRESH_INPLACE=1 ;;
+      --keep-old) REFRESH_KEEP_OLD=1 ;;
+      --no-serve) no_serve=1 ;;
+      --) shift; while [ $# -gt 0 ]; do export_args+=("$1"); shift; done; break ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1   (pass exporter flags after --)" ;;
+    esac
+    shift
+  done
+
+  [ -f "$HERE/freeform.py" ] || die "freeform.py is not next to boardctl.
+  refresh re-reads Apple Freeform, so it only runs on the Mac that holds the
+  boards. On any other machine, copy the export directory across instead."
+  command -v python3 >/dev/null 2>&1 || die "python3 is required to export."
+
+  # Any --board the caller passed narrows the field; the ignore file is
+  # applied afterwards and always wins, so a board on both lists stays out.
+  local select_args=() passthru=()
+  set -- ${export_args[@]+"${export_args[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --board) shift; [ $# -gt 0 ] || die "--board needs a value"
+               select_args+=("$1") ;;
+      --board=*) select_args+=("${1#--board=}") ;;
+      *) passthru+=("$1") ;;
+    esac
+    shift
+  done
+
+  local sel_flags=()
+  local s
+  for s in ${select_args[@]+"${select_args[@]}"}; do
+    sel_flags+=(--select "$s")
+  done
+
+  bold "Reading the board list"
+  local listing
+  listing="$(python3 "$HERE/freeform.py" list --json)" \
+    || die "could not read the board list from Freeform."
+
+  local allowed ignored unmatched
+  allowed="$(printf '%s' "$listing" | python3 "$HERE/boardfilter.py" \
+             "$ABS_IGNORE_FILE" --allowed ${sel_flags[@]+"${sel_flags[@]}"})"
+  ignored="$(printf '%s' "$listing" | python3 "$HERE/boardfilter.py" \
+             "$ABS_IGNORE_FILE" --ignored ${sel_flags[@]+"${sel_flags[@]}"})"
+  unmatched="$(printf '%s' "$listing" | python3 "$HERE/boardfilter.py" \
+               "$ABS_IGNORE_FILE" --unmatched ${sel_flags[@]+"${sel_flags[@]}"})"
+
+  local allow_flags=() ignore_flags=() n_allow=0 n_ignore=0 uuid
+  while IFS= read -r uuid; do
+    [ -n "$uuid" ] || continue
+    allow_flags+=(--board "$uuid"); n_allow=$((n_allow + 1))
+  done <<EOF
+$allowed
+EOF
+  while IFS= read -r uuid; do
+    [ -n "$uuid" ] || continue
+    ignore_flags+=(--board "$uuid"); n_ignore=$((n_ignore + 1))
+  done <<EOF
+$ignored
+EOF
+
+  info "$n_allow to serve, $n_ignore held back by $IGNORE_FILE"
+  if [ -n "$unmatched" ]; then
+    while IFS= read -r s; do
+      [ -n "$s" ] && warn "$IGNORE_FILE: \"$s\" matches no board"
+    done <<EOF
+$unmatched
+EOF
+  fi
+
+  trap cleanup EXIT INT TERM
+
+  if [ "$n_allow" -eq 0 ]; then
+    warn "every board is held back, so there is nothing to serve."
+    empty_out "$ABS_BOARDS"
+  else
+    export_swap "$ABS_BOARDS" "the served boards" \
+      ${allow_flags[@]+"${allow_flags[@]}"} \
+      ${passthru[@]+"${passthru[@]}"}
+  fi
+
+  if [ "$n_ignore" -gt 0 ]; then
+    export_swap "$ABS_IGNORED" "the held-back boards" \
+      ${ignore_flags[@]+"${ignore_flags[@]}"} \
+      ${passthru[@]+"${passthru[@]}"}
+    info "held back in $ABS_IGNORED — not mounted, not in the served index"
+  elif [ -d "$ABS_IGNORED" ]; then
+    info "$ABS_IGNORED still holds an earlier set; nothing is held back now"
+  fi
+
+  local boards
+  boards=$(find "$ABS_BOARDS" -mindepth 2 -maxdepth 2 -name index.html 2>/dev/null | wc -l | tr -d ' ')
+  info "$boards board(s) now in $ABS_BOARDS"
+
+  trap - EXIT INT TERM
+
+  [ "$no_serve" -eq 1 ] && return 0
+
+  if ! docker_ready; then
+    bold "Container"
+    if have_docker; then
+      info "docker daemon is not running — the export is refreshed regardless."
+      info "start it and run ./boardctl up when you want it served."
+    else
+      info "docker is not installed — serve it directly with ./boardctl serve"
+    fi
+    return 0
+  fi
+
+  if [ "$rebuild" -eq 1 ]; then
+    cmd_build
+    cmd_up
+    return 0
+  fi
+
+  bold "Container"
+  case "$(container_state)" in
+    running)
+      # Nothing to do. The files under the mount were replaced, and the
+      # server reads them per request.
+      info "$CONTAINER is running and already serving the new export"
+      ;;
+    *) cmd_up ;;
+  esac
+}
+
+# ---- entry -----------------------------------------------------------------
+
+usage() {
+  cat <<'USAGE'
+boardctl — export Apple Freeform boards and serve them from a container
+
+  ./boardctl refresh          re-export everything, swap it in, keep serving
+  ./boardctl up               build if needed and start the container
+                              (same as ./dockerRun.sh)
+  ./boardctl down             stop and remove the container
+  ./boardctl restart
+  ./boardctl build            rebuild the image (only after serve.py changes)
+  ./boardctl logs [-f]
+  ./boardctl status           what exists, what is running, what answers
+  ./boardctl serve            run the server directly, without docker
+  ./boardctl ignored          which boards the ignore file holds back
+
+refresh options
+
+  --rebuild        rebuild the image and recreate the container as well
+  --in-place       export straight over the live directory instead of
+                   staging a copy first: no second copy on disk, but the
+                   boards are unavailable while it runs
+  --keep-old       keep the previous export as <boards>.previous
+  --no-serve       export only, do not touch docker
+  -- <flags>       everything after -- goes to `freeform.py export`,
+                   e.g.  ./boardctl refresh -- --board MCAT --no-previews
+
+Boards named in .boardignore are still exported and still get their viewer,
+but they go to IGNORED_DIR instead: not mounted into the container, and not in
+the served index.html. `freeform.py backup` copies everything regardless.
+
+Settings live in .env — copy .env.example to start.
+USAGE
+}
+
+command="${1:-}"
+[ $# -gt 0 ] && shift || true
+
+case "$command" in
+  refresh) cmd_refresh "$@" ;;
+  build)   cmd_build "$@" ;;
+  up|start) cmd_up "$@" ;;
+  down|stop) cmd_down "$@" ;;
+  restart) cmd_restart "$@" ;;
+  logs)    cmd_logs "$@" ;;
+  status)  cmd_status "$@" ;;
+  serve)   cmd_serve "$@" ;;
+  ignored) python3 "$HERE/freeform.py" list --json \
+             | python3 "$HERE/boardfilter.py" "$ABS_IGNORE_FILE" --report ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $command   (try ./boardctl help)" ;;
+esac
