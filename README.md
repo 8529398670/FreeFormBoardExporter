@@ -131,6 +131,9 @@ plus an `index.html` at the top listing every board.
 
 Coordinates are in points, origin top-left, x right and y down — the same space
 Freeform uses. `geometry` is the rectangle the item occupies on the board.
+Freeform stores a grouped item relative to its group, and groups nest; the
+exporter adds those offsets back in, so grouped items are in board
+coordinates like everything else, and `parent` names the group.
 `width`/`height` are `null` where Freeform sizes an item automatically (text
 boxes, mostly). `rotation` is radians. The board's saved camera is under
 `board.viewport` as `zoom` and `offset`.
@@ -171,10 +174,19 @@ whole folder to a phone and open it there — it needs no server and no network.
   from 0.2% to 100000%; text and link cards stay sharp the whole way up, because
   the board is real HTML being re-rendered rather than a picture being enlarged.
   You cannot pan off into nothing — a corner of the board always stays on screen.
-- **Save any file** — tap an image, video or attachment for a sheet with its
-  name, size and a Download button. On iOS a long press still offers "Save to
-  Photos" as usual. Videos keep `preload="none"`, so a board full of them costs
-  nothing until you press play.
+- **Tap any item for its card** — its name and size, with **Download**,
+  **Open** and **Share**. Download and Open are there for anything with a file;
+  on a link card Open goes to the page. On iOS a long press on a picture still
+  offers "Save to Photos" as usual.
+- **Link to any item** — tapping an item puts its id in the address bar,
+  `Propaganda/#DF103E7B-7551-4A39-A649-BDAC3A826C0D`, and Share copies that
+  link. Opening it glides the board to that item, centres it, and opens its
+  card. The id is Freeform's own, the same one `layout.json` uses, so a link
+  keeps working after the board is exported again.
+- **Videos** — show their poster with a play button. The play button plays the
+  video in place; tapping anywhere else on it opens its card, and a selected
+  video gets the player's own controls. Videos keep `preload="none"`, so a
+  board full of them costs nothing until you press play.
 - **Text** — selectable and copyable once you tap it, and findable with the
   browser's own Find. Tapping first means a drag over text pans instead of
   selecting.
@@ -221,7 +233,7 @@ folder. See [DEPLOY.md](DEPLOY.md).
 | Text and sticky notes | Full text content, with font size, weight, italics and colour |
 | Links | URL, page title, site name, and the preview picture |
 | Position, size, rotation | Per item, in board coordinates |
-| Parent/child grouping | `parent` field |
+| Parent/child grouping | `parent` field; grouped items placed in board coordinates |
 | Board viewport | zoom and scroll offset |
 | Freehand drawings | Recorded with geometry; stroke paths are **not** decoded |
 | Shape fills | Decoded where present |

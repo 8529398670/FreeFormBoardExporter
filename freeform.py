@@ -244,6 +244,46 @@ def content_rect(specific_data):
     return _find_geometry(body) if body is not None else None
 
 
+def place_on_board(items):
+    """Move grouped items from their group's coordinates onto the board.
+
+    A group is a container item, and it stores its children relative to its
+    own origin — groups nest, so an item two groups deep is two offsets away
+    from the board. The board's root container has no parent and sits at the
+    origin, so its direct children are already in board coordinates.
+
+    A group's size slot holds values like 1.0 or 1.72 rather than a size.
+    Freeform does not apply them to what is inside: a grouped item keeps the
+    size it is drawn at. Only the offset carries down.
+    """
+    by_id = {item["id"]: item for item in items}
+    origins = {}
+
+    def origin(container_id, seen=()):
+        """Where a container's local (0, 0) lands on the board."""
+        if container_id in origins:
+            return origins[container_id]
+        node = by_id.get(container_id)
+        if (node is None or node["parent"] is None or not node["geometry"]
+                or container_id in seen):
+            point = (0.0, 0.0)
+        else:
+            px, py = origin(node["parent"], seen + (container_id,))
+            point = (px + node["geometry"]["x"], py + node["geometry"]["y"])
+        origins[container_id] = point
+        return point
+
+    # Resolve every offset before moving anything, since a nested group's own
+    # position is itself one of the local coordinates being rewritten.
+    shifts = [(item, origin(item["parent"])) for item in items
+              if item["parent"] and item["geometry"]]
+    for item, (dx, dy) in shifts:
+        if dx or dy:
+            item["geometry"] = dict(item["geometry"],
+                                    x=item["geometry"]["x"] + dx,
+                                    y=item["geometry"]["y"] + dy)
+
+
 # --- text -----------------------------------------------------------------
 #
 # Text is a CRDT sequence: each inserted run appears as {5:{1:"chars"}}.
@@ -730,6 +770,7 @@ class FreeformLibrary:
                     meta["has_image"] = bool(info.get("image"))
             items.append(entry)
 
+        place_on_board(items)
         items.sort(key=lambda i: (
             i["geometry"]["y"] if i["geometry"] else 0.0,
             i["geometry"]["x"] if i["geometry"] else 0.0,
@@ -1199,7 +1240,8 @@ def _write_layout(board_dir, board, items):
             "origin": "top-left; x grows right, y grows down",
             "note": ("width/height are null when Freeform sizes the item "
                      "automatically. rotation is in radians. geometry is the "
-                     "rectangle the item occupies on the board."),
+                     "rectangle the item occupies on the board, for grouped "
+                     "items as well; parent names the group."),
             "crop": ("Present on a cropped image. Draw the file at "
                      "full_width x full_height, offset by minus offset_x and "
                      "minus offset_y, clipped to geometry."),
